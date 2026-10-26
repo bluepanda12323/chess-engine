@@ -1,0 +1,7 @@
+chess
+numpy
+matplotlib
+jupyter
+zstandard
+tqdm
+# framework: torch of tensorflow (nog te kiezen)
