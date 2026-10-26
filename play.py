@@ -7,7 +7,7 @@ from ai.encoding import board_to_tensor, move_to_index
 from ai.model import ChessModel
 
 model = ChessModel(num_inputs=448, num_hidden=400, num_layers=5, num_outputs=4096)
-model.load_state_dict(torch.load("models/best_model.tar", weights_only=True))
+model.load_state_dict(torch.load("models/best_model.tar", weights_only=True, map_location="cpu"))
 model.eval()
 
 

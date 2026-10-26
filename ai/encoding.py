@@ -1,3 +1,5 @@
+import math
+
 import chess
 import torch
 
@@ -34,3 +36,9 @@ def index_to_move(index, board):
         promotion = chess.QUEEN
 
     return chess.Move(from_square, to_square, promotion=promotion)
+
+
+def score_to_label(cp, mate):
+    if mate is not None and not math.isnan(mate):
+        return 1.0 if mate > 0 else -1.0
+    return 2 / (1 + math.exp(-0.00368208 * cp)) - 1
