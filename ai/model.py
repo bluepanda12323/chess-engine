@@ -20,3 +20,15 @@ class ChessModel(nn.Module):
             x = self.act_fn(layer(x))
         x = self.output(x)
         return x
+
+
+class ValueModel(ChessModel):
+
+    def __init__(self, num_inputs, num_hidden, num_layers):
+        super().__init__(num_inputs, num_hidden, num_layers, num_outputs=1)
+        self.output_act_fn = nn.Tanh()
+
+    def forward(self, x):
+        x = super().forward(x)
+        x = self.output_act_fn(x)
+        return x[:, 0]
