@@ -1,6 +1,8 @@
+import os
 import random
 
 import chess
+import chess.engine
 import torch
 
 from ai.encoding import board_to_tensor, move_to_index
@@ -8,6 +10,8 @@ from ai.model import ChessModel, ValueModel
 from engine import search
 
 SEARCH_DEPTH = 4
+RUST_DEPTH = 6
+RUST_ENGINE_PATH = os.path.abspath(os.path.join("engine-rs", "target", "release", "engine-rs.exe"))
 
 model = ChessModel(num_inputs=448, num_hidden=400, num_layers=5, num_outputs=4096)
 model.load_state_dict(torch.load("models/best_model.tar", weights_only=True, map_location="cpu"))
@@ -17,9 +21,15 @@ value_model = ValueModel(num_inputs=448, num_hidden=400, num_layers=5)
 value_model.load_state_dict(torch.load("models/value_model.tar", weights_only=True, map_location="cpu"))
 value_model.eval()
 
+rust_engine = chess.engine.SimpleEngine.popen_uci([RUST_ENGINE_PATH, "models/value_weights.bin"])
+
 
 def alphabeta_player(board):
     return search.best_move(board, SEARCH_DEPTH, value_model)
+
+
+def rust_player(board):
+    return rust_engine.play(board, chess.engine.Limit(depth=RUST_DEPTH)).move
 
 
 def network_player(board):
@@ -65,4 +75,7 @@ def play_game(white, black):
 
 
 if __name__ == "__main__":
-    play_game(human_player, alphabeta_player)
+    try:
+        play_game(rust_player, human_player)
+    finally:
+        rust_engine.quit()
