@@ -4,11 +4,22 @@ import chess
 import torch
 
 from ai.encoding import board_to_tensor, move_to_index
-from ai.model import ChessModel
+from ai.model import ChessModel, ValueModel
+from engine import search
+
+SEARCH_DEPTH = 4
 
 model = ChessModel(num_inputs=448, num_hidden=400, num_layers=5, num_outputs=4096)
 model.load_state_dict(torch.load("models/best_model.tar", weights_only=True, map_location="cpu"))
 model.eval()
+
+value_model = ValueModel(num_inputs=448, num_hidden=400, num_layers=5)
+value_model.load_state_dict(torch.load("models/value_model.tar", weights_only=True, map_location="cpu"))
+value_model.eval()
+
+
+def alphabeta_player(board):
+    return search.best_move(board, SEARCH_DEPTH, value_model)
 
 
 def network_player(board):
@@ -54,4 +65,4 @@ def play_game(white, black):
 
 
 if __name__ == "__main__":
-    play_game(human_player, network_player)
+    play_game(human_player, alphabeta_player)

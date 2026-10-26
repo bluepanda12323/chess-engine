@@ -19,7 +19,7 @@ def best_score(evals):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--out", default="data/evals.csv")
-    parser.add_argument("--max-positions", type=int, default=3_000_000)
+    parser.add_argument("--max-positions", type=int, default=x)
     args = parser.parse_args()
 
     positions = 0
