@@ -8,6 +8,7 @@ import torch
 from ai.encoding import board_to_tensor, move_to_index
 from ai.model import ChessModel, ValueModel
 from engine import search
+from engine.evaluate import evaluate
 
 SEARCH_DEPTH = 4
 RUST_DEPTH = 6
@@ -66,8 +67,9 @@ def play_game(white, black):
         print(board, "\n")
         player = white if board.turn == chess.WHITE else black
         move = player(board)
-        print("Played:", board.san(move), "\n")
+        print("Played:", board.san(move))
         board.push(move)
+        print(f"AI eval: {evaluate(board, value_model):+.2f}\n")
 
     print(board)
     print("Result:", board.result())
