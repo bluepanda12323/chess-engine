@@ -1,55 +1,20 @@
 import os
-import random
 
 import chess
 import chess.engine
-import torch
 
-from ai.encoding import board_to_tensor, move_to_index
-from ai.model import ChessModel, ValueModel
-from engine import search
-from engine.evaluate import evaluate
+MOVE_TIME = 1.0
+ENGINE_PATH = os.path.abspath(os.path.join("engine-rs", "target", "release", "engine-rs.exe"))
+WEIGHTS_PATH = os.path.abspath(os.path.join("models", "nnue.bin"))
 
-SEARCH_DEPTH = 4
-RUST_DEPTH = 6
-RUST_ENGINE_PATH = os.path.abspath(os.path.join("engine-rs", "target", "release", "engine-rs.exe"))
-
-model = ChessModel(num_inputs=448, num_hidden=400, num_layers=5, num_outputs=4096)
-model.load_state_dict(torch.load("models/best_model.tar", weights_only=True, map_location="cpu"))
-model.eval()
-
-value_model = ValueModel(num_inputs=448, num_hidden=400, num_layers=5)
-value_model.load_state_dict(torch.load("models/value_model.tar", weights_only=True, map_location="cpu"))
-value_model.eval()
-
-rust_engine = chess.engine.SimpleEngine.popen_uci([RUST_ENGINE_PATH, "models/value_weights.bin"])
+engine = chess.engine.SimpleEngine.popen_uci([ENGINE_PATH, WEIGHTS_PATH])
 
 
-def alphabeta_player(board):
-    return search.best_move(board, SEARCH_DEPTH, value_model)
-
-
-def rust_player(board):
-    return rust_engine.play(board, chess.engine.Limit(depth=RUST_DEPTH)).move
-
-
-def network_player(board):
-    x = board_to_tensor(board).unsqueeze(0)
-    with torch.no_grad():
-        scores = model(x)[0]
-
-    best_move, best_score = None, None
-    for move in board.legal_moves:
-        if move.promotion not in (None, chess.QUEEN):
-            continue
-        score = scores[move_to_index(move)].item()
-        if best_score is None or score > best_score:
-            best_move, best_score = move, score
-    return best_move
-
-
-def random_player(board):
-    return random.choice(list(board.legal_moves))
+def engine_player(board):
+    result = engine.play(board, chess.engine.Limit(time=MOVE_TIME), info=chess.engine.INFO_SCORE)
+    if "score" in result.info:
+        print("Engine eval:", result.info["score"].white())
+    return result.move
 
 
 def human_player(board):
@@ -67,9 +32,8 @@ def play_game(white, black):
         print(board, "\n")
         player = white if board.turn == chess.WHITE else black
         move = player(board)
-        print("Played:", board.san(move))
+        print("Played:", board.san(move), "\n")
         board.push(move)
-        print(f"AI eval: {evaluate(board, value_model):+.2f}\n")
 
     print(board)
     print("Result:", board.result())
@@ -78,6 +42,6 @@ def play_game(white, black):
 
 if __name__ == "__main__":
     try:
-        play_game(rust_player, human_player)
+        play_game(engine_player, human_player)
     finally:
-        rust_engine.quit()
+        engine.quit()

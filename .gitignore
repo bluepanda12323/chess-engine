@@ -7,3 +7,8 @@ models/
 *.pt
 *.keras
 engine-rs/target/
+versions/
+matches/
+stockfish/
+tablebases/
+tools/
