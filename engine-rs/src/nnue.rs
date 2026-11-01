@@ -5,6 +5,12 @@ const PAWN_FEATURES: usize = 384;
 const COUNT_FEATURES: usize = 100;
 const MOBILITY_FEATURES: usize = 640;
 const MAX_HIDDEN: usize = 1024;
+const MAX_PIECES: usize = 32;
+const MAX_PAWN_FEATURES: usize = 48;
+const MAX_COUNT_FEATURES: usize = 10;
+const MAX_MOBILITY_TOTAL: usize = 128;
+const ACCUMULATOR_LIMIT: f32 = 32000.0;
+const OUTPUT_LIMIT: f32 = 2.0e9;
 const FILE_A: u64 = 0x0101_0101_0101_0101;
 const FILE_H: u64 = FILE_A << 7;
 const RAYS: [(i32, i32); 8] = [(1, 0), (-1, 0), (0, 1), (0, -1), (1, 1), (1, -1), (-1, 1), (-1, -1)];
@@ -27,18 +33,23 @@ pub struct Nnue {
     hidden: usize,
     layer2: usize,
     screlu: bool,
-    feature_weights: Vec<f32>,
-    feature_bias: Vec<f32>,
+    activation_scale: i16,
+    feature_weights: Vec<i16>,
+    feature_bias: Vec<i16>,
     psqt_weights: Vec<f32>,
     hidden_weights: Vec<f32>,
+    quantized_hidden: Vec<i16>,
+    hidden_scale: f32,
     hidden_bias: Vec<f32>,
     output_weights: Vec<f32>,
+    quantized_output: Vec<i16>,
+    output_scale: f32,
     output_bias: f32,
 }
 
 #[derive(Clone, Copy)]
 pub struct Accumulator {
-    values: [[f32; MAX_HIDDEN]; 2],
+    values: [[i16; MAX_HIDDEN]; 2],
     psqt: [f32; 2],
     counts: [u8; 10],
     mobility: [u8; MOBILITY_FEATURES],
@@ -113,22 +124,73 @@ fn dot(inputs: &[f32], weights: &[f32]) -> f32 {
     inputs.iter().zip(weights).fold(0.0, |sum, (&input, &weight)| sum.algebraic_add(input.algebraic_mul(weight)))
 }
 
-fn activated_dot(values: &[f32], weights: &[f32], squared: bool) -> f32 {
-    if squared {
-        values.iter().zip(weights).fold(0.0, |sum, (&value, &weight)| {
-            let clipped = value.clamp(0.0, 1.0);
-            sum.algebraic_add(clipped.algebraic_mul(clipped).algebraic_mul(weight))
-        })
-    } else {
-        values.iter().zip(weights).fold(0.0, |sum, (&value, &weight)| sum.algebraic_add(value.clamp(0.0, 1.0).algebraic_mul(weight)))
+#[cfg(target_feature = "avx2")]
+fn clipped_dot(values: &[i16], weights: &[i16], limit: i16) -> i32 {
+    use std::arch::x86_64::*;
+    let (value_blocks, value_rest) = values.as_chunks::<16>();
+    let (weight_blocks, weight_rest) = weights.as_chunks::<16>();
+    let mut sums = [0i32; 8];
+    unsafe {
+        let (low, high) = (_mm256_setzero_si256(), _mm256_set1_epi16(limit));
+        let mut total = _mm256_setzero_si256();
+        for (value, weight) in value_blocks.iter().zip(weight_blocks) {
+            let value = _mm256_loadu_si256(value.as_ptr().cast());
+            let weight = _mm256_loadu_si256(weight.as_ptr().cast());
+            total = _mm256_add_epi32(total, _mm256_madd_epi16(_mm256_min_epi16(_mm256_max_epi16(value, low), high), weight));
+        }
+        _mm256_storeu_si256(sums.as_mut_ptr().cast(), total);
+    }
+    sums.iter().sum::<i32>() + scalar_clipped_dot(value_rest, weight_rest, limit)
+}
+
+#[cfg(not(target_feature = "avx2"))]
+fn clipped_dot(values: &[i16], weights: &[i16], limit: i16) -> i32 {
+    scalar_clipped_dot(values, weights, limit)
+}
+
+fn scalar_clipped_dot(values: &[i16], weights: &[i16], limit: i16) -> i32 {
+    values.iter().zip(weights).map(|(&value, &weight)| i32::from(value.clamp(0, limit)) * i32::from(weight)).sum()
+}
+
+fn activate_into(inputs: &mut [f32], values: &[i16], limit: i16, squared: bool) {
+    for (input, &value) in inputs.iter_mut().zip(values) {
+        let clipped = value.clamp(0, limit) as f32 / limit as f32;
+        *input = if squared { clipped * clipped } else { clipped };
     }
 }
 
-fn activate_into(inputs: &mut [f32], values: &[f32], squared: bool) {
-    for (input, &value) in inputs.iter_mut().zip(values) {
-        let clipped = value.clamp(0.0, 1.0);
-        *input = if squared { clipped * clipped } else { clipped };
+fn quantize(values: &[f32], scale: f32) -> Vec<i16> {
+    values.iter().map(|&value| (value * scale).round() as i16).collect()
+}
+
+fn activation_scale(weights: &[f32], bias: &[f32], groups: &[(usize, usize)]) -> i16 {
+    let hidden = bias.len();
+    let mut largest = 0.0f32;
+    for (unit, &b) in bias.iter().enumerate() {
+        let mut bound = b.abs();
+        let mut first_row = 0;
+        for &(rows, active) in groups.iter().filter(|&&(rows, _)| rows > 0) {
+            let mut column: Vec<f32> = (first_row..first_row + rows).map(|row| weights[row * hidden + unit].abs()).collect();
+            let first = column.len() - active.min(column.len());
+            column.select_nth_unstable_by(first, f32::total_cmp);
+            bound += column[first..].iter().sum::<f32>();
+            first_row += rows;
+        }
+        largest = largest.max(bound);
     }
+    (ACCUMULATOR_LIMIT / largest).clamp(1.0, i16::MAX as f32) as i16
+}
+
+fn output_quantization(weights: &[f32], activation_scale: i16) -> f32 {
+    let largest = weights.iter().fold(0.0f32, |largest, weight| largest.max(weight.abs()));
+    let total: f32 = weights.iter().map(|weight| weight.abs()).sum();
+    (i16::MAX as f32 / largest).min(OUTPUT_LIMIT / (activation_scale as f32 * total))
+}
+
+fn hidden_quantization(weights: &[f32], row_length: usize, activation_scale: i16) -> f32 {
+    let largest = weights.iter().fold(0.0f32, |largest, weight| largest.max(weight.abs()));
+    let total = weights.chunks_exact(row_length.max(1)).map(|row| row.iter().map(|weight| weight.abs()).sum::<f32>()).fold(0.0f32, f32::max);
+    (i16::MAX as f32 / largest).min(OUTPUT_LIMIT / (activation_scale as f32 * total))
 }
 
 fn north_span(squares: u64) -> u64 {
@@ -203,35 +265,15 @@ fn piece_feature(view: View, perspective: Color, piece: Piece, square: Square) -
 
 impl Nnue {
     pub fn load(path: &str) -> std::io::Result<Nnue> {
-        let bytes = std::fs::read(path)?;
-        let mut reader = Reader { bytes: &bytes, pos: 0 };
+        Ok(Nnue::parse(&std::fs::read(path)?))
+    }
 
-        let nnue = if bytes.starts_with(b"NNU4") {
-            reader.pos = 4;
-            let features = reader.u32() as usize;
-            let hidden = reader.u32() as usize;
-            let screlu = reader.u32() == 1;
-            assert!(features == PIECE_FEATURES && hidden <= MAX_HIDDEN, "expected a {PIECE_FEATURES} -> at most {MAX_HIDDEN} NNUE, got {features} -> {hidden}");
+    fn parse(bytes: &[u8]) -> Nnue {
+        let mut reader = Reader { bytes, pos: 0 };
+        let mut buckets = [0; 64];
+        let has_psqt = bytes.starts_with(b"NNU2") || bytes.starts_with(b"NNU3");
 
-            Nnue {
-                num_buckets: 1,
-                buckets: [0; 64],
-                mirror: false,
-                pawn_features: false,
-                count_features: false,
-                mobility_features: false,
-                hidden,
-                layer2: 0,
-                screlu,
-                feature_weights: reader.f32s(features * hidden),
-                feature_bias: reader.f32s(hidden),
-                psqt_weights: vec![0.0; features],
-                hidden_weights: Vec::new(),
-                hidden_bias: Vec::new(),
-                output_weights: reader.f32s(2 * hidden),
-                output_bias: reader.f32s(1)[0],
-            }
-        } else if bytes.starts_with(b"NNU2") || bytes.starts_with(b"NNU3") {
+        let (num_buckets, mirror, pawn_features, count_features, mobility_features, hidden, layer2, screlu) = if has_psqt {
             reader.pos = 4;
             let num_buckets = reader.u32() as usize;
             let mirror = reader.u32() == 1;
@@ -239,61 +281,67 @@ impl Nnue {
             let hidden = reader.u32() as usize;
             let layer2 = reader.u32() as usize;
             let (count_features, mobility_features) = if bytes.starts_with(b"NNU3") { (reader.u32() == 1, reader.u32() == 1) } else { (false, false) };
-            let mut buckets = [0; 64];
             for bucket in buckets.iter_mut() {
                 *bucket = reader.u32() as usize;
             }
-            let features = num_buckets * PIECE_FEATURES
-                + if pawn_features { PAWN_FEATURES } else { 0 }
-                + if count_features { COUNT_FEATURES } else { 0 }
-                + if mobility_features { MOBILITY_FEATURES } else { 0 };
-            assert!(hidden <= MAX_HIDDEN, "at most {MAX_HIDDEN} hidden units, got {hidden}");
-
-            Nnue {
-                num_buckets,
-                buckets,
-                mirror,
-                pawn_features,
-                count_features,
-                mobility_features,
-                hidden,
-                layer2,
-                screlu: false,
-                feature_weights: reader.f32s(features * hidden),
-                feature_bias: reader.f32s(hidden),
-                psqt_weights: reader.f32s(features),
-                hidden_weights: reader.f32s(layer2 * 2 * hidden),
-                hidden_bias: reader.f32s(layer2),
-                output_weights: reader.f32s(if layer2 == 0 { 2 * hidden } else { layer2 }),
-                output_bias: reader.f32s(1)[0],
-            }
+            (num_buckets, mirror, pawn_features, count_features, mobility_features, hidden, layer2, false)
         } else {
+            let has_screlu_flag = bytes.starts_with(b"NNU4");
+            reader.pos = if has_screlu_flag { 4 } else { 0 };
             let features = reader.u32() as usize;
             let hidden = reader.u32() as usize;
-            assert!(features == PIECE_FEATURES && hidden <= MAX_HIDDEN, "expected a {PIECE_FEATURES} -> at most {MAX_HIDDEN} NNUE, got {features} -> {hidden}");
-
-            Nnue {
-                num_buckets: 1,
-                buckets: [0; 64],
-                mirror: false,
-                pawn_features: false,
-                count_features: false,
-                mobility_features: false,
-                hidden,
-                layer2: 0,
-                screlu: false,
-                feature_weights: reader.f32s(features * hidden),
-                feature_bias: reader.f32s(hidden),
-                psqt_weights: vec![0.0; features],
-                hidden_weights: Vec::new(),
-                hidden_bias: Vec::new(),
-                output_weights: reader.f32s(2 * hidden),
-                output_bias: reader.f32s(1)[0],
-            }
+            let screlu = has_screlu_flag && reader.u32() == 1;
+            assert!(features == PIECE_FEATURES, "expected {PIECE_FEATURES} input features, got {features}");
+            (1, false, false, false, false, hidden, 0, screlu)
         };
+        assert!(hidden <= MAX_HIDDEN, "at most {MAX_HIDDEN} hidden units, got {hidden}");
 
+        let features = num_buckets * PIECE_FEATURES
+            + if pawn_features { PAWN_FEATURES } else { 0 }
+            + if count_features { COUNT_FEATURES } else { 0 }
+            + if mobility_features { MOBILITY_FEATURES } else { 0 };
+        let feature_weights = reader.f32s(features * hidden);
+        let feature_bias = reader.f32s(hidden);
+        let psqt_weights = if has_psqt { reader.f32s(features) } else { vec![0.0; features] };
+        let hidden_weights = reader.f32s(layer2 * 2 * hidden);
+        let hidden_bias = reader.f32s(layer2);
+        let output_weights = reader.f32s(if layer2 == 0 { 2 * hidden } else { layer2 });
+        let output_bias = reader.f32s(1)[0];
         assert!(reader.pos == bytes.len(), "the NNUE file is {} bytes, expected {}", bytes.len(), reader.pos);
-        Ok(nnue)
+
+        let groups = [
+            (num_buckets * PIECE_FEATURES, MAX_PIECES),
+            (if pawn_features { PAWN_FEATURES } else { 0 }, MAX_PAWN_FEATURES),
+            (if count_features { COUNT_FEATURES } else { 0 }, MAX_COUNT_FEATURES),
+            (if mobility_features { MOBILITY_FEATURES } else { 0 }, MAX_MOBILITY_TOTAL),
+        ];
+        let activation_scale = activation_scale(&feature_weights, &feature_bias, &groups);
+        let output_quantization = output_quantization(&output_weights, activation_scale);
+        let hidden_quantization = hidden_quantization(&hidden_weights, 2 * hidden, activation_scale);
+
+        Nnue {
+            num_buckets,
+            buckets,
+            mirror,
+            pawn_features,
+            count_features,
+            mobility_features,
+            hidden,
+            layer2,
+            screlu,
+            activation_scale,
+            feature_weights: quantize(&feature_weights, activation_scale as f32),
+            feature_bias: quantize(&feature_bias, activation_scale as f32),
+            psqt_weights,
+            quantized_hidden: quantize(&hidden_weights, hidden_quantization),
+            hidden_scale: 1.0 / (activation_scale as f32 * hidden_quantization),
+            hidden_weights,
+            hidden_bias,
+            quantized_output: quantize(&output_weights, output_quantization),
+            output_scale: 1.0 / (activation_scale as f32 * output_quantization),
+            output_weights,
+            output_bias,
+        }
     }
 
     fn view(&self, board: &Board, perspective: Color) -> View {
@@ -334,8 +382,8 @@ impl Nnue {
             for kind in 0..5 {
                 let index = side(color) * 5 + kind;
                 if old[index] != new[index] {
-                    self.add(acc, perspective, self.count_feature(perspective, color, kind, old[index]), -1.0);
-                    self.add(acc, perspective, self.count_feature(perspective, color, kind, new[index]), 1.0);
+                    self.add(acc, perspective, self.count_feature(perspective, color, kind, old[index]), -1);
+                    self.add(acc, perspective, self.count_feature(perspective, color, kind, new[index]), 1);
                 }
             }
         }
@@ -348,45 +396,47 @@ impl Nnue {
             }
             for (i, (&b, &a)) in before.iter().zip(after).enumerate() {
                 if b != a {
-                    self.add(acc, perspective, self.mobility_feature(view, perspective, block * 8 + i), a as f32 - b as f32);
+                    self.add(acc, perspective, self.mobility_feature(view, perspective, block * 8 + i), a as i16 - b as i16);
                 }
             }
         }
     }
 
-    fn column(&self, feature: usize) -> &[f32] {
+    fn column(&self, feature: usize) -> &[i16] {
         &self.feature_weights[feature * self.hidden..(feature + 1) * self.hidden]
     }
 
-    fn add(&self, acc: &mut Accumulator, perspective: Color, feature: usize, sign: f32) {
+    fn add(&self, acc: &mut Accumulator, perspective: Color, feature: usize, sign: i16) {
         for (value, &weight) in acc.values[perspective as usize][..self.hidden].iter_mut().zip(self.column(feature)) {
-            *value += sign * weight;
+            *value = value.wrapping_add(sign.wrapping_mul(weight));
         }
-        acc.psqt[perspective as usize] += sign * self.psqt_weights[feature];
+        acc.psqt[perspective as usize] += sign as f32 * self.psqt_weights[feature];
     }
 
-    fn apply(&self, acc: &mut Accumulator, perspective: Color, added: &[usize], removed: &[usize]) {
+    fn apply(&self, acc: &mut Accumulator, source: &[i16], perspective: Color, added: &[usize], removed: &[usize]) {
         let values = &mut acc.values[perspective as usize][..self.hidden];
+        let source = &source[..self.hidden];
         match (added, removed) {
             (&[plus], &[minus]) => {
-                for ((value, &a), &r) in values.iter_mut().zip(self.column(plus)).zip(self.column(minus)) {
-                    *value += a - r;
+                for (((value, &old), &a), &r) in values.iter_mut().zip(source).zip(self.column(plus)).zip(self.column(minus)) {
+                    *value = old.wrapping_add(a.wrapping_sub(r));
                 }
             }
             (&[plus], &[minus1, minus2]) => {
-                for (((value, &a), &r1), &r2) in values.iter_mut().zip(self.column(plus)).zip(self.column(minus1)).zip(self.column(minus2)) {
-                    *value += a - r1 - r2;
+                for ((((value, &old), &a), &r1), &r2) in values.iter_mut().zip(source).zip(self.column(plus)).zip(self.column(minus1)).zip(self.column(minus2)) {
+                    *value = old.wrapping_add(a.wrapping_sub(r1).wrapping_sub(r2));
                 }
             }
             _ => {
+                values.copy_from_slice(source);
                 for &feature in added {
                     for (value, &weight) in values.iter_mut().zip(self.column(feature)) {
-                        *value += weight;
+                        *value = value.wrapping_add(weight);
                     }
                 }
                 for &feature in removed {
                     for (value, &weight) in values.iter_mut().zip(self.column(feature)) {
-                        *value -= weight;
+                        *value = value.wrapping_sub(weight);
                     }
                 }
             }
@@ -400,10 +450,10 @@ impl Nnue {
             for kind in 0..3 {
                 let (before, after) = (old[color as usize][kind], new[color as usize][kind]);
                 for square in Bitboard(before & !after) {
-                    self.add(acc, perspective, self.pawn_feature(view, perspective, color, kind, square), -1.0);
+                    self.add(acc, perspective, self.pawn_feature(view, perspective, color, kind, square), -1);
                 }
                 for square in Bitboard(after & !before) {
-                    self.add(acc, perspective, self.pawn_feature(view, perspective, color, kind, square), 1.0);
+                    self.add(acc, perspective, self.pawn_feature(view, perspective, color, kind, square), 1);
                 }
             }
         }
@@ -414,7 +464,7 @@ impl Nnue {
         acc.values[perspective as usize][..self.hidden].copy_from_slice(&self.feature_bias);
         acc.psqt[perspective as usize] = 0.0;
         for (square, piece) in board {
-            self.add(acc, perspective, piece_feature(view, perspective, piece, square), 1.0);
+            self.add(acc, perspective, piece_feature(view, perspective, piece, square), 1);
         }
         if self.pawn_features {
             self.update_pawns(acc, perspective, view, &[[0; 3]; 2], &pawn_structure(board));
@@ -423,7 +473,7 @@ impl Nnue {
             for color in [Color::White, Color::Black] {
                 for kind in 0..5 {
                     let count = acc.counts[side(color) * 5 + kind];
-                    self.add(acc, perspective, self.count_feature(perspective, color, kind, count), 1.0);
+                    self.add(acc, perspective, self.count_feature(perspective, color, kind, count), 1);
                 }
             }
         }
@@ -434,7 +484,7 @@ impl Nnue {
     }
 
     pub fn refresh(&self, board: &Board) -> Accumulator {
-        let mut acc = Accumulator { values: [[0.0; MAX_HIDDEN]; 2], psqt: [0.0; 2], counts: [0; 10], mobility: [0; MOBILITY_FEATURES] };
+        let mut acc = Accumulator { values: [[0; MAX_HIDDEN]; 2], psqt: [0.0; 2], counts: [0; 10], mobility: [0; MOBILITY_FEATURES] };
         if self.count_features {
             acc.counts = piece_counts(board);
         }
@@ -447,7 +497,6 @@ impl Nnue {
     }
 
     pub fn update(&self, acc: &Accumulator, before: &Board, after: &Board) -> Accumulator {
-        let mut next = *acc;
         let mut changed = (before.white() ^ after.white()) | (before.black() ^ after.black());
         for role in Role::ALL {
             changed |= before.by_role(role) ^ after.by_role(role);
@@ -456,8 +505,7 @@ impl Nnue {
         let (old_pawns, new_pawns) = if pawns_changed { (pawn_structure(before), pawn_structure(after)) } else { ([[0; 3]; 2], [[0; 3]; 2]) };
         let new_counts = if self.count_features { piece_counts(after) } else { acc.counts };
         let new_mobility = if self.mobility_features { mobility(after) } else { acc.mobility };
-        next.counts = new_counts;
-        next.mobility = new_mobility;
+        let mut next = Accumulator { values: [[0; MAX_HIDDEN]; 2], psqt: acc.psqt, counts: new_counts, mobility: new_mobility };
 
         for perspective in [Color::White, Color::Black] {
             let view = self.view(after, perspective);
@@ -477,7 +525,7 @@ impl Nnue {
                     num_added += 1;
                 }
             }
-            self.apply(&mut next, perspective, &added[..num_added], &removed[..num_removed]);
+            self.apply(&mut next, &acc.values[perspective as usize], perspective, &added[..num_added], &removed[..num_removed]);
             if pawns_changed {
                 self.update_pawns(&mut next, perspective, view, &old_pawns, &new_pawns);
             }
@@ -494,17 +542,30 @@ impl Nnue {
 
     pub fn evaluate(&self, acc: &Accumulator, turn: Color) -> f32 {
         let psqt = (acc.psqt[turn as usize] - acc.psqt[turn.other() as usize]) / 2.0;
-        if self.layer2 == 0 {
-            let (own, other) = self.output_weights.split_at(self.hidden);
-            let us = activated_dot(&acc.values[turn as usize][..self.hidden], own, self.screlu);
-            let them = activated_dot(&acc.values[turn.other() as usize][..self.hidden], other, self.screlu);
-            return self.output_bias + us + them + psqt;
+        let us = &acc.values[turn as usize][..self.hidden];
+        let them = &acc.values[turn.other() as usize][..self.hidden];
+        if self.layer2 == 0 && !self.screlu {
+            let (own, other) = self.quantized_output.split_at(self.hidden);
+            let sum = clipped_dot(us, own, self.activation_scale) + clipped_dot(them, other, self.activation_scale);
+            return self.output_bias + sum as f32 * self.output_scale + psqt;
+        }
+        if !self.screlu {
+            let mut output = self.output_bias;
+            for (j, row) in self.quantized_hidden.chunks_exact(2 * self.hidden).enumerate() {
+                let (own, other) = row.split_at(self.hidden);
+                let sum = clipped_dot(us, own, self.activation_scale) + clipped_dot(them, other, self.activation_scale);
+                output += (self.hidden_bias[j] + sum as f32 * self.hidden_scale).clamp(0.0, 1.0) * self.output_weights[j];
+            }
+            return output + psqt;
         }
 
         let mut inputs = [0.0; 2 * MAX_HIDDEN];
-        activate_into(&mut inputs[..self.hidden], &acc.values[turn as usize][..self.hidden], self.screlu);
-        activate_into(&mut inputs[self.hidden..2 * self.hidden], &acc.values[turn.other() as usize][..self.hidden], self.screlu);
+        activate_into(&mut inputs[..self.hidden], us, self.activation_scale, self.screlu);
+        activate_into(&mut inputs[self.hidden..2 * self.hidden], them, self.activation_scale, self.screlu);
         let inputs = &inputs[..2 * self.hidden];
+        if self.layer2 == 0 {
+            return self.output_bias + dot(inputs, &self.output_weights) + psqt;
+        }
 
         let mut output = self.output_bias;
         for (j, row) in self.hidden_weights.chunks_exact(2 * self.hidden).enumerate() {
@@ -531,56 +592,45 @@ mod tests {
         (0..count).map(|_| (random(seed) % 2001) as f32 / 10000.0 - 0.1).collect()
     }
 
-    fn random_screlu_nnue() -> Nnue {
+    fn encode(magic: &[u8], header: &[u32], blocks: &[Vec<f32>]) -> Vec<u8> {
+        let mut bytes = magic.to_vec();
+        for value in header {
+            bytes.extend(value.to_le_bytes());
+        }
+        for value in blocks.iter().flatten() {
+            bytes.extend(value.to_le_bytes());
+        }
+        bytes
+    }
+
+    fn random_plain_nnue(screlu: bool) -> Nnue {
         let mut seed = 192837465;
         let hidden = 16;
-        Nnue {
-            num_buckets: 1,
-            buckets: [0; 64],
-            mirror: false,
-            pawn_features: false,
-            count_features: false,
-            mobility_features: false,
-            hidden,
-            layer2: 0,
-            screlu: true,
-            feature_weights: random_weights(&mut seed, PIECE_FEATURES * hidden),
-            feature_bias: random_weights(&mut seed, hidden),
-            psqt_weights: vec![0.0; PIECE_FEATURES],
-            hidden_weights: Vec::new(),
-            hidden_bias: Vec::new(),
-            output_weights: random_weights(&mut seed, 2 * hidden),
-            output_bias: 0.1,
-        }
+        let blocks = [
+            random_weights(&mut seed, PIECE_FEATURES * hidden),
+            random_weights(&mut seed, hidden),
+            random_weights(&mut seed, 2 * hidden),
+            vec![0.1],
+        ];
+        Nnue::parse(&encode(b"NNU4", &[PIECE_FEATURES as u32, hidden as u32, u32::from(screlu)], &blocks))
     }
 
     fn random_nnue() -> Nnue {
         let mut seed = 987654321;
         let (num_buckets, hidden, layer2) = (8, 16, 4);
         let features = num_buckets * PIECE_FEATURES + PAWN_FEATURES + COUNT_FEATURES + MOBILITY_FEATURES;
-        let mut buckets = [0; 64];
-        for (square, bucket) in buckets.iter_mut().enumerate() {
-            *bucket = (square / 8).min(3) * 2 + usize::from(square % 8 % 4 >= 2);
-        }
-
-        Nnue {
-            num_buckets,
-            buckets,
-            mirror: true,
-            pawn_features: true,
-            count_features: true,
-            mobility_features: true,
-            hidden,
-            layer2,
-            screlu: false,
-            feature_weights: random_weights(&mut seed, features * hidden),
-            feature_bias: random_weights(&mut seed, hidden),
-            psqt_weights: random_weights(&mut seed, features),
-            hidden_weights: random_weights(&mut seed, layer2 * 2 * hidden),
-            hidden_bias: random_weights(&mut seed, layer2),
-            output_weights: random_weights(&mut seed, layer2),
-            output_bias: 0.1,
-        }
+        let mut header = vec![num_buckets as u32, 1, 1, hidden as u32, layer2 as u32, 1, 1];
+        header.extend((0..64).map(|square| (square / 8).min(3) * 2 + u32::from(square % 8 % 4 >= 2)));
+        let blocks = [
+            random_weights(&mut seed, features * hidden),
+            random_weights(&mut seed, hidden),
+            random_weights(&mut seed, features),
+            random_weights(&mut seed, layer2 * 2 * hidden),
+            random_weights(&mut seed, layer2),
+            random_weights(&mut seed, layer2),
+            vec![0.1],
+        ];
+        Nnue::parse(&encode(b"NNU3", &header, &blocks))
     }
 
     fn check_updates(nnue: &Nnue) {
@@ -613,9 +663,7 @@ mod tests {
 
                 let fresh = nnue.refresh(pos.board());
                 for side in 0..2 {
-                    for i in 0..nnue.hidden {
-                        assert!((acc.values[side][i] - fresh.values[side][i]).abs() < 1e-3);
-                    }
+                    assert_eq!(acc.values[side][..nnue.hidden], fresh.values[side][..nnue.hidden]);
                     assert!((acc.psqt[side] - fresh.psqt[side]).abs() < 1e-3);
                 }
                 assert!((nnue.evaluate(&acc, pos.turn()) - nnue.evaluate(&fresh, pos.turn())).abs() < 1e-3);
@@ -624,6 +672,37 @@ mod tests {
 
         println!("checked: {castles} castles, {en_passants} en passant, {promotions} promotions, {king_moves} king moves");
         assert!(castles > 0 && en_passants > 0 && promotions > 0 && king_moves > 0);
+    }
+
+    fn float_evaluate(nnue: &Nnue, acc: &Accumulator, turn: Color) -> f32 {
+        let psqt = (acc.psqt[turn as usize] - acc.psqt[turn.other() as usize]) / 2.0;
+        let mut inputs = vec![0.0; 2 * nnue.hidden];
+        activate_into(&mut inputs[..nnue.hidden], &acc.values[turn as usize][..nnue.hidden], nnue.activation_scale, false);
+        activate_into(&mut inputs[nnue.hidden..], &acc.values[turn.other() as usize][..nnue.hidden], nnue.activation_scale, false);
+        let mut output = nnue.output_bias;
+        for (j, row) in nnue.hidden_weights.chunks_exact(2 * nnue.hidden).enumerate() {
+            output += (nnue.hidden_bias[j] + dot(&inputs, row)).clamp(0.0, 1.0) * nnue.output_weights[j];
+        }
+        output + psqt
+    }
+
+    #[test]
+    fn quantized_layer2_matches_float() {
+        let nnue = random_nnue();
+        let mut seed = 2468;
+        let mut pos = Chess::default();
+        let mut largest = 0.0f32;
+        for _ in 0..200 {
+            let moves = pos.legal_moves();
+            if moves.is_empty() {
+                break;
+            }
+            pos.play_unchecked(moves[(random(&mut seed) % moves.len() as u64) as usize]);
+            let acc = nnue.refresh(pos.board());
+            largest = largest.max((nnue.evaluate(&acc, pos.turn()) - float_evaluate(&nnue, &acc, pos.turn())).abs());
+        }
+        println!("largest difference between int16 and float layer2: {largest}");
+        assert!(largest < 1e-3);
     }
 
     #[test]
@@ -638,6 +717,11 @@ mod tests {
 
     #[test]
     fn update_matches_refresh_with_screlu() {
-        check_updates(&random_screlu_nnue());
+        check_updates(&random_plain_nnue(true));
+    }
+
+    #[test]
+    fn update_matches_refresh_with_clipped_relu() {
+        check_updates(&random_plain_nnue(false));
     }
 }
